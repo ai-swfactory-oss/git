@@ -35,7 +35,12 @@ out=$(cd "$2" && pwd)
 
 version=$(jq -er .version "$manifest")
 work=$(mktemp -d)
-xz -dc "$fetched/src/git-$version.tar.xz" | tar -xf - -C "$work"
+# Decompress to a file, then extract from it: tar may stop reading at the
+# archive's end marker before xz has written everything, and under pipefail
+# xz then fails on the closed pipe.
+xz -dc "$fetched/src/git-$version.tar.xz" >"$work/git-$version.tar"
+tar -xf "$work/git-$version.tar" -C "$work"
+rm -f "$work/git-$version.tar"
 src="$work/git-$version"
 cd "$src"
 
