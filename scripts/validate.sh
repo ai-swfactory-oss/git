@@ -7,7 +7,12 @@
 #   1. gpg, gpgv and xz must be on PATH (the tarball is verified with gpgv
 #      against a keyring built from the pinned key, no agent involved; without
 #      them nothing can be trusted, so validate fails naming them);
-#   2. shellcheck over every shell script;
+#   2. shellcheck over every shell script, and a YAML syntax check of every
+#      workflow in .github/workflows with the packaged yamllint
+#      (@ai-swfactory-oss/yamllint, installed into a scratch prefix, never
+#      globally). A known-bad fixture must fail it first, so the check is not
+#      vacuous. A workflow GitHub cannot parse never runs, so the merge would
+#      publish nothing;
 #   3. named test test/signature-mismatch.sh: a tarball signed by another key,
 #      a tampered tarball and a tarball with no signature are each refused;
 #      a good signature passes;
@@ -64,6 +69,28 @@ jq -e --arg p "$host" '.platforms | index($p) != null' upstream.json >/dev/null 
 
 echo "== shellcheck"
 shellcheck scripts/*.sh test/*.sh
+
+echo "== workflow YAML syntax (packaged yamllint)"
+yamllint_version=1.38.0
+mkdir -p "$work/yamllint"
+printf '{"name":"validate-yamllint","version":"1.0.0","private":true}\n' >"$work/yamllint/package.json"
+# The scope's registry line comes from this repository's .npmrc; the token,
+# if any, stays in the user's own ~/.npmrc.
+cp .npmrc "$work/yamllint/.npmrc"
+npm install --prefix "$work/yamllint" --no-save --no-audit --no-fund \
+  "@ai-swfactory-oss/yamllint@$yamllint_version" >"$work/yamllint-install.log" 2>&1 ||
+  { cat "$work/yamllint-install.log"; echo "validate: could not install @ai-swfactory-oss/yamllint@$yamllint_version" >&2; exit 1; }
+yamllint="$work/yamllint/node_modules/.bin/yamllint"
+[ -x "$yamllint" ] || { echo "validate: $yamllint is missing after install" >&2; exit 1; }
+# Syntax only: no style rules, so only a document YAML cannot parse fails.
+syntax_only='{rules: {}}'
+printf 'jobs:\n  a:\n    steps:\n      - name: bad (linux: colon)\n' >"$work/bad-workflow.yml"
+if "$yamllint" -d "$syntax_only" "$work/bad-workflow.yml" >"$work/bad-workflow.txt" 2>&1; then
+  cat "$work/bad-workflow.txt"; echo "validate: yamllint accepted a workflow YAML cannot parse" >&2; exit 1
+fi
+cat "$work/bad-workflow.txt"
+"$yamllint" -d "$syntax_only" .github/workflows/*.yml
+echo "workflows: YAML syntax OK"
 
 echo "== named test: signature mismatch"
 bash test/signature-mismatch.sh
