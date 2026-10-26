@@ -1,0 +1,21 @@
+git - the fast distributed version control system
+https://git-scm.com/
+Copyright (C) Linus Torvalds, Junio C Hamano and the git contributors.
+
+git is free software: you can redistribute it and/or modify it under the
+terms of version 2 of the GNU General Public License as published by the Free
+Software Foundation (see LICENSE). It is distributed WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. Some files in the git source carry other GPLv2-compatible
+licences, as git's COPYING and the file headers state.
+
+TLS: no TLS library is included. HTTPS goes through the host's own libcurl,
+loaded dynamically at run time: on macOS /usr/lib/libcurl.4.dylib, part of
+the operating system; on linux libcurl-gnutls.so.4 (curl built against
+GnuTLS, LGPL-2.1-or-later), as Debian and Ubuntu link their own git.
+
+This npm package is published by ai-swfactory-oss
+(https://github.com/ai-swfactory-oss/git), which is not affiliated with the
+git project or Software Freedom Conservancy. It is built from the unmodified
+git release tarball; no change is made to the source. The package is
+distributed under GPL-2.0-only.
