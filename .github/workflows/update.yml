@@ -1,0 +1,124 @@
+name: update
+
+# Daily: if kernel.org has published a newer stable git release
+# (https://www.kernel.org/pub/software/scm/git/git-X.Y.Z.tar.xz; release
+# candidates are ignored), set upstream.json's version to it and open a pull
+# request; build.yml then fetches the tarball, refusing it unless its
+# signature verifies against the key fingerprint pinned in this repository,
+# and builds and tests the result on every platform. Merging publishes
+# (build.yml runs on the push to main). Then make sure the packages for main's
+# upstream.json are published: every successful publish ends with a GitHub
+# release v<version>, so a missing release means "not published yet", and a
+# failed build is retried every day until it succeeds.
+#
+# A release signed by a different key fails the build: a maintainer reviews
+# and pins the new key by hand.
+#
+# Monthly: keep the schedule alive. GitHub disables scheduled workflows after
+# 60 days without repository activity.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+    - cron: "37 5 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  actions: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    outputs:
+      missing: ${{ steps.check.outputs.missing }}
+      sha: ${{ steps.check.outputs.sha }}
+      bump: ${{ steps.bump.outputs.sha }}
+      branch: ${{ steps.bump.outputs.branch }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Is main's version published?
+        id: check
+        run: |
+          tag="v$(bash scripts/pkgver.sh)"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "missing=false" >> "$GITHUB_OUTPUT"; echo "$tag already released"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"; echo "$tag not released: building"
+          fi
+
+      - name: Keepalive (monthly)
+        if: github.event.schedule == '37 5 1 * *'
+        run: gh api -X PUT "repos/$GH_REPO/actions/workflows/update.yml/enable"
+
+      - name: Follow new stable git releases
+        id: follow
+        run: |
+          current=$(jq -er .version upstream.json)
+          curl -fsSL "https://www.kernel.org/pub/software/scm/git/" -o index.html
+          grep -oE 'git-[0-9]+\.[0-9]+\.[0-9]+\.tar\.xz"' index.html | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V > versions.txt
+          rm index.html
+          latest=$(tail -n1 versions.txt)
+          rm versions.txt
+          if [ -z "$latest" ]; then
+            echo "no stable git release found on kernel.org" >&2; exit 1
+          fi
+          if [ "$latest" = "$current" ] || [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)" = "$current" ]; then
+            echo "git $current is current"; exit 0
+          fi
+          echo "kernel.org has git $latest; this repository pins $current"
+          jq --arg v "$latest" '.version = $v | .repack = 0' upstream.json > upstream.json.new
+          mv upstream.json.new upstream.json
+          cat upstream.json
+          echo "version=$(bash scripts/pkgver.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump pull request
+        id: bump
+        if: steps.follow.outputs.version != ''
+        env:
+          VERSION: ${{ steps.follow.outputs.version }}
+        run: |
+          branch="update/git-$VERSION"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if gh pr list --head "$branch" --state open --json number --jq '.[0].number' | grep -q .; then
+            echo "pull request for $branch already open"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "chore: update git to $VERSION"
+          git push --force origin "$branch"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          gh pr create --head "$branch" --base main --title "chore: update git to $VERSION" \
+            --body "kernel.org published git $VERSION. The build refuses the tarball unless its signature verifies against the key fingerprint pinned in this repository. The update run that opened this pull request then built and tested the packages on every platform (pull requests opened with GITHUB_TOKEN start no pr workflow); merging publishes them."
+
+  test-bump:
+    needs: update
+    if: needs.update.outputs.bump != ''
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.update.outputs.bump }}
+      publish: false
+    secrets: inherit
+
+  build:
+    needs: update
+    if: needs.update.outputs.missing == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.update.outputs.sha }}
+      publish: true
+    secrets: inherit

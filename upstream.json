@@ -1,0 +1,15 @@
+{
+  "version": "2.56.0",
+  "repack": 0,
+  "signing_key": "96E07AF25771955980DAD10020D04E5A713660A7",
+  "platforms": [
+    "darwin-arm64",
+    "darwin-x64",
+    "linux-arm64",
+    "linux-x64"
+  ],
+  "builder": {
+    "linux": "ubuntu-22.04 and ubuntu-22.04-arm runners (glibc 2.35), against the host libcurl-gnutls and zlib",
+    "macos_deployment_target": "12.0"
+  }
+}

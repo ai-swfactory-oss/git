@@ -1,0 +1,24 @@
+{
+  "name": "@ai-swfactory-oss/git",
+  "description": "git, built from the signed kernel.org release, as a native tree for your platform: no download at install time, no install scripts",
+  "keywords": [
+    "git",
+    "vcs"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "git": "bin/git.js"
+  },
+  "files": [
+    "bin/git.js",
+    "index.js",
+    "index.d.ts",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

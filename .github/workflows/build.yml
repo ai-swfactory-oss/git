@@ -1,0 +1,299 @@
+name: build
+
+# Fetches the git release tarball named in upstream.json from kernel.org
+# (verified against its signature by the maintainer key fingerprint pinned in
+# this repository: a missing or bad signature stops here, before anything is
+# compiled), builds a relocatable git tree natively on each platform (linux:
+# on ubuntu-22.04 runners, dynamic against the host glibc, zlib and
+# libcurl-gnutls; darwin: macOS system libraries only; no TLS library is
+# shipped), renders the npm packages, packs them once, and installs the packed
+# tarballs on every platform's runner as a consumer would. When publishing,
+# every tarball and git binary gets a build-provenance attestation, then the
+# exact tested tarballs go to GitHub Packages (platform packages first, the
+# launcher last; versions that already exist are skipped), then a GitHub
+# release v<version> carries the tarballs, the complete corresponding source
+# (the kernel.org tarball, its signature, SOURCE-SHA256SUMS,
+# build-scripts.tar.gz) and SHA256SUMS.
+# Pull requests (this workflow called from pr.yml) build and test only.
+
+on:
+  push:
+    branches: [main]
+    paths: [upstream.json, keys/**, scripts/**, packages/**, test/**, .github/workflows/build.yml]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the packages and the release
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build
+        type: string
+        required: true
+      publish:
+        description: Publish the packages and the release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Metadata
+        id: meta
+        run: |
+          {
+            echo "version=$(bash scripts/pkgver.sh)"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Named test: a missing, bad or foreign signature fails the fetch"
+        run: bash test/signature-mismatch.sh
+
+      - name: Fetch the git release tarball (signature verified)
+        run: bash scripts/fetch.sh build/upstream
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source
+          path: build/upstream/src/*
+          if-no-files-found: error
+
+  build:
+    needs: fetch
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x64
+          - runner: ubuntu-22.04-arm
+            platform: linux-arm64
+          - runner: macos-latest
+            platform: darwin-arm64
+          - runner: macos-15-intel
+            platform: darwin-x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: build/upstream/src
+
+      - name: Build dependencies (linux: the GnuTLS libcurl and zlib headers)
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-gnutls-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          bash scripts/build.sh build/upstream build/bin
+          # Artifacts drop file modes: carry the tree as a tarball.
+          tar -czf build/tree.tar.gz -C build/bin .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: git-${{ matrix.platform }}
+          path: build/tree.tar.gz
+          if-no-files-found: error
+
+  pack:
+    needs: [fetch, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: git-*
+          path: build/built
+
+      - name: Stage packages
+        run: |
+          # download-artifact names each directory after its artifact (git-<platform>);
+          # each holds the build's tree as a tarball, file modes intact.
+          for platform in $(jq -r '.platforms | join(" ")' upstream.json); do
+            mkdir -p "build/built/$platform"
+            tar -xzf "build/built/git-$platform/tree.tar.gz" -C "build/built/$platform"
+          done
+          bash scripts/stage.sh build/built build/npm
+
+      - name: "Named tests: the launcher's platform errors"
+        run: GIT_LAUNCHER_DIR="$PWD/build/npm/git" node --test test/launcher.test.js
+
+      - name: Pack
+        run: |
+          mkdir -p dist/tgz
+          for dir in build/npm/*/; do
+            npm pack "./$dir" --pack-destination dist/tgz
+          done
+          ls -l dist/tgz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm
+          path: dist/tgz/*.tgz
+          if-no-files-found: error
+
+  test:
+    needs: pack
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          - runner: macos-latest
+            platform: darwin-arm64
+          - runner: macos-15-intel
+            platform: darwin-x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm
+          path: dist/tgz
+
+      - name: "Named test: install the packed tarballs; version, exec-path, init/commit/log, HTTPS, linkage"
+        run: bash scripts/smoke.sh dist/tgz ${{ matrix.platform }}
+
+  publish:
+    needs: [fetch, test]
+    if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.fetch.outputs.version }}
+      SHA: ${{ needs.fetch.outputs.sha }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.fetch.outputs.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@ai-swfactory-oss"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm
+          path: dist/tgz
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: source
+          path: dist/source
+
+      - name: Extract the git binaries to attest
+        run: |
+          mkdir -p dist/bin
+          for platform in $(jq -r '.platforms | join(" ")' upstream.json); do
+            tar -xzOf "dist/tgz/ai-swfactory-oss-git-$platform-$VERSION.tgz" package/git/bin/git > "dist/bin/git-$platform"
+            test -s "dist/bin/git-$platform"
+          done
+          sha256sum dist/bin/*
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/tgz/*.tgz
+            dist/bin/git-*
+
+      - name: Publish to GitHub Packages (platforms first, launcher last)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          publish() {
+            local name=$1 file
+            file="dist/tgz/$(echo "${name#@}" | tr / -)-$VERSION.tgz"
+            if [ "$(npm view "$name@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+              echo "$name@$VERSION already published: skipping"
+              return
+            fi
+            npm publish "$file" --tag latest
+          }
+          for platform in $(jq -r '.platforms | join(" ")' upstream.json); do
+            publish "@ai-swfactory-oss/git-$platform"
+          done
+          publish "@ai-swfactory-oss/git"
+
+      # The release is the corresponding source the NOTICE in every package
+      # points at (GPL-2.0 section 3). It must never be deleted while the
+      # matching package version is served.
+      - name: Create GitHub release v${{ needs.fetch.outputs.version }} with the corresponding source
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists: skipping"
+            exit 0
+          fi
+          mkdir -p dist/release
+          cp dist/tgz/*.tgz dist/source/* dist/release/
+          tar -czf dist/release/build-scripts.tar.gz upstream.json keys scripts packages test .github LICENSE README.md
+          (cd dist/release && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          {
+            echo "git $(jq -r .version upstream.json), as npm packages on GitHub Packages, package version \`$VERSION\`."
+            echo
+            echo '```sh'
+            echo "npm install --save-dev @ai-swfactory-oss/git@$VERSION"
+            echo '```'
+            echo
+            echo "Built from the kernel.org tarball attached here, verified against its signature by the key pinned in this repository (fingerprint $(jq -r .signing_key upstream.json)). No TLS library is shipped: HTTPS uses the host's libcurl (macOS: /usr/lib/libcurl.4.dylib; linux: libcurl-gnutls.so.4)."
+            echo
+            echo "**Corresponding source (GPL-2.0-only):** \`git-*.tar.xz\`, its \`.tar.sign\`, \`SOURCE-SHA256SUMS\`, and \`build-scripts.tar.gz\` (manifest, keys, scripts, workflows)."
+            echo
+            echo "License: GPL-2.0-only. Assets: the npm tarballs as published, the corresponding source, and \`SHA256SUMS\` over all of them."
+          } > dist/notes.md
+          gh release create "$tag" dist/release/* --target "$SHA" --title "$tag" --notes-file dist/notes.md --latest
