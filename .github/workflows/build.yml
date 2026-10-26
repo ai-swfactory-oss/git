@@ -103,7 +103,7 @@ jobs:
           name: source
           path: build/upstream/src
 
-      - name: Build dependencies (linux: the GnuTLS libcurl and zlib headers)
+      - name: "Build dependencies (linux: the GnuTLS libcurl and zlib headers)"
         if: startsWith(matrix.platform, 'linux-')
         run: |
           sudo apt-get update
